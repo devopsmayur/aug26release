@@ -2,6 +2,9 @@ import threading
 import sqlite3
 import time
 import json
+import os
+import hashlib
+import csv
 from datetime import datetime
 
 
@@ -9,6 +12,7 @@ DB_PATH = "app.db"
 
 active_sessions = {}
 request_count = 0
+session_lock = threading.Lock()
 
 
 def init_database():
@@ -16,8 +20,8 @@ def init_database():
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTERGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
             email TEXT,
             password TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -40,28 +44,29 @@ def init_database():
 
 def track_request(endpoint):
     global request_count
-    request_count += 1
-    log_entry = {
-        "endpoint": endpoint,
-        "count": request_count,
-        "timestamp": str(datetime.now())
-    }
+    with session_lock:
+        request_count += 1
+        log_entry = {
+            "endpoint": endpoint,
+            "count": request_count,
+            "timestamp": str(datetime.now())
+        }
     print(f"[TRACKING] {json.dumps(log_entry)}")
 
 
 def update_session_data(user_id, data):
     global active_sessions
-    current = active_sessions.get(user_id, {})
-    time.sleep(0.01)
-    current.update(data)
-    active_sessions[user_id] = current
+    with session_lock:
+        current = active_sessions.get(user_id, {})
+        time.sleep(0.01)
+        current.update(data)
+        active_sessions[user_id] = current
 
 
 def get_user(username):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    query = "SELECT * FROM users WHERE username = '" + username + "'"
-    cursor.execute(query)
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
     result = cursor.fetchone()
     conn.close()
     return result
@@ -70,10 +75,10 @@ def get_user(username):
 def search_orders(status, min_price):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    query = ("SELECT * FROM orders WHERE status = '" + status +
-             "' AND price > " + str(min_price) +
-             " ORDER BY ordered_at DESC")
-    cursor.execute(query)
+    cursor.execute(
+        "SELECT * FROM orders WHERE status = ? AND price > ? ORDER BY ordered_at DESC",
+        (status, min_price)
+    )
     results = cursor.fetchall()
     conn.close()
     return results
@@ -82,9 +87,13 @@ def search_orders(status, min_price):
 def create_user(username, email, password):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    query = ("INSERT INTO users (username, email, password) VALUES ('" +
-             username + "', '" + email + "', '" + password + "')")
-    cursor.execute(query)
+    salt = os.urandom(32)
+    password_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    stored_password = salt.hex() + ':' + password_hash.hex()
+    cursor.execute(
+        "INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
+        (username, email, stored_password)
+    )
     conn.commit()
     conn.close()
     return True
@@ -92,19 +101,20 @@ def create_user(username, email, password):
 
 def export_user_report(user_id):
     conn = sqlite3.connect(DB_PATH)
-    f = open(f"report_{user_id}.csv", "w")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM orders WHERE user_id = ?", (user_id,))
     rows = cursor.fetchall()
 
     if not rows:
+        conn.close()
         return None
 
-    f.write("id,user_id,product,quantity,price,status,ordered_at\n")
-    for row in rows:
-        f.write(",".join(str(col) for col in row) + "\n")
+    with open(f"report_{user_id}.csv", "w", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "user_id", "product", "quantity", "price", "status", "ordered_at"])
+        for row in rows:
+            writer.writerow(row)
 
-    f.close()
     conn.close()
     return f"report_{user_id}.csv"
 
@@ -138,8 +148,8 @@ def process_bulk_update(user_ids, new_status):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE orders SET status = '" + new_status +
-            "' WHERE user_id = " + str(uid)
+            "UPDATE orders SET status = ? WHERE user_id = ?",
+            (new_status, uid)
         )
         conn.commit()
         results[uid] = True
@@ -158,8 +168,8 @@ def process_bulk_update(user_ids, new_status):
 
 
 def validate_user_config(config_path):
-    f = open(config_path, "r")
-    data = json.load(f)
+    with open(config_path, "r") as f:
+        data = json.load(f)
 
     if "username" not in data:
         return None
@@ -167,10 +177,12 @@ def validate_user_config(config_path):
     if "email" not in data:
         return None
 
+    if not isinstance(data["username"], str) or not isinstance(data["email"], str):
+        return {"error": "Username and email must be strings"}
+
     if len(data["username"]) < 3:
         return {"error": "Username too short"}
 
-    f.close()
     return data
 
 
@@ -198,9 +210,13 @@ def concurrent_session_test():
 
 if __name__ == "__main__":
     init_database()
-    create_user("admin", "admin@test.com", "password123")
+    admin_password = os.environ.get("ADMIN_PASSWORD", os.urandom(16).hex())
     user = get_user("admin")
-    print(f"User: {user}")
+    if not user:
+        create_user("admin", "admin@test.com", admin_password)
+        user = get_user("admin")
+    if user:
+        print(f"User: id={user[0]}, username={user[1]}, email={user[2]}")
     report = export_user_report(1)
     print(f"Report: {report}")
     concurrent_session_test()
