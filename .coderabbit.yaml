@@ -1,0 +1,5 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+reviews:
+  path_instructions:
+    - path: service.py
+      instructions: "Use standard-library Python and retain the module's procedural style: snake_case for functions and variables, UPPER_CASE for constants, and no class-based abstraction unless the design is intentionally changed."
