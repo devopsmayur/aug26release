@@ -1,481 +1,686 @@
-"""
-Payment Processing Service for Banking Application
-Author: Development Team
-Version: 1.1.0  (extended vulnerable fixture — FOR SECURITY-TOOL TESTING ONLY)
+"""Security-focused payment processing examples used by review tests.
 
-This module handles credit card transactions, customer authentication,
-and payment processing for our core banking platform.
-
-WARNING: This file intentionally contains security vulnerabilities. It is a
-test corpus for code review / SAST tooling and must never be deployed.
+Importing this module is side-effect free. Runtime secrets and database
+connections are acquired only when the corresponding service is instantiated.
 """
 
-import hashlib
-import random
-import sqlite3
-import logging
-import requests
-import os
-import pickle
 import base64
+import hashlib
+import hmac
+import ipaddress
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import secrets
+import socket
+import sqlite3
+import subprocess
 import tempfile
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
-import jwt          # PyJWT
+import jwt  # PyJWT
+import requests
 import yaml
 from lxml import etree
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
+
 logger = logging.getLogger(__name__)
 
-# Database connection string — loaded from environment, never hardcoded
-DATABASE_URL = os.environ["DATABASE_URL"]
+REQUEST_TIMEOUT = (3.05, 15)
 
-# API Keys and Secrets (for payment gateway integration)
-# PCI-DSS Req 2.2.2 / 3.6.1: secrets must not be hardcoded in source
-PAYMENT_GATEWAY_API_KEY = os.environ["PAYMENT_GATEWAY_API_KEY"]
-ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]
-JWT_SECRET = os.environ["JWT_SECRET"]
 
-# Stripe Secret Key
-STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
+def _required_secret(name):
+    """Read a required secret at point of use, not during module import."""
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Required environment variable {name} is not set")
+    return value
 
-# CWE-798: hardcoded fallback signing secret used when the env var is absent
-JWT_FALLBACK_SECRET = os.environ.get("JWT_SECRET", "change-me-please-2024")
+
+def _mask_pan(card_number):
+    """Retain at most the PAN's BIN and last four digits."""
+    digits = "".join(character for character in str(card_number) if character.isdigit())
+    if len(digits) < 10:
+        return "****"
+    return f"{digits[:6]}{'*' * (len(digits) - 10)}{digits[-4:]}"
+
+
+def _base64url_encode(value):
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _base64url_decode(value):
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _validated_public_https_url(url):
+    """Validate that a URL resolves exclusively to public HTTPS endpoints."""
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ValueError("Only HTTPS URLs with a hostname are allowed")
+    if parsed.username or parsed.password:
+        raise ValueError("URL credentials are not allowed")
+
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            parsed.port or 443,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ValueError("URL hostname could not be resolved") from exc
+
+    if not addresses:
+        raise ValueError("URL hostname could not be resolved")
+    for address in addresses:
+        resolved_ip = ipaddress.ip_address(address[4][0])
+        if not resolved_ip.is_global:
+            raise ValueError("URL hostname resolves to a non-public address")
+    return url
 
 
 class PaymentProcessor:
-    """Handles all payment card transactions."""
+    """Handle card transactions without retaining cardholder data."""
 
-    def __init__(self):
-        self.db_connection = sqlite3.connect('payments.db')
-        self.api_key = PAYMENT_GATEWAY_API_KEY
+    def __init__(self, db_path="payments.db", api_key=None):
+        self.db_connection = sqlite3.connect(db_path)
+        self.api_key = api_key or _required_secret("PAYMENT_GATEWAY_API_KEY")
 
     def process_card_payment(self, card_number, cvv, expiry, amount, customer_id):
-        """
-        Process a credit card payment.
+        masked_pan = _mask_pan(card_number)
+        logger.info("Processing payment customer_id=%s card=%s", customer_id, masked_pan)
 
-        Args:
-            card_number: Full 16-digit card number
-            cvv: 3-digit security code
-            expiry: Card expiration date
-            amount: Transaction amount
-            customer_id: Customer identifier
-        """
-        # PCI-DSS Req 3.2/3.3/3.4/10.3.4: never log PAN or CVV
-        logger.info(f"Processing payment for customer {customer_id}, amount={amount}")
-
-        # Store card details for recurring payments
-        self._store_card_details(customer_id, card_number, cvv, expiry)
-
-        # Validate card using simple check
         if not self._validate_card(card_number):
-            logger.error(f"Invalid card number: {card_number}")
-            return {"status": "failed", "error": f"Card {card_number} is invalid"}
+            logger.warning("Rejected payment customer_id=%s card=%s", customer_id, masked_pan)
+            return {"status": "failed", "error": "Card details are invalid"}
 
-        # Process with payment gateway
-        response = self._call_payment_gateway(card_number, cvv, expiry, amount)
+        try:
+            gateway_result, gateway_token = self._call_payment_gateway(
+                card_number, cvv, expiry, amount
+            )
+        except (requests.RequestException, ValueError):
+            logger.warning(
+                "Payment gateway failure customer_id=%s card=%s",
+                customer_id,
+                masked_pan,
+            )
+            return {"status": "failed", "error": "Payment could not be processed"}
 
-        # Log full response including sensitive data
-        logger.info(f"Gateway response: {response}")
+        if gateway_token and gateway_result["status"] == "success":
+            self._store_card_details(customer_id, gateway_token)
 
-        return response
+        logger.info(
+            "Payment completed customer_id=%s card=%s transaction_id=%s",
+            customer_id,
+            masked_pan,
+            gateway_result.get("transaction_id"),
+        )
+        return gateway_result
 
-    def _store_card_details(self, customer_id, card_number, cvv, expiry):
-        """Store card details for future transactions."""
+    def process_recurring_payment(self, customer_id, amount):
+        """Process a recurring payment using only the stored gateway token."""
+        stored_method = self.db_connection.execute(
+            "SELECT gateway_token FROM stored_cards WHERE customer_id = ? LIMIT 1",
+            (customer_id,),
+        ).fetchone()
+        if stored_method is None:
+            return {"status": "failed", "error": "No stored payment method"}
+
+        try:
+            result = self._call_recurring_payment_gateway(stored_method[0], amount)
+        except (requests.RequestException, ValueError):
+            logger.warning("Recurring payment failed customer_id=%s", customer_id)
+            return {"status": "failed", "error": "Payment could not be processed"}
+
+        logger.info(
+            "Recurring payment completed customer_id=%s transaction_id=%s",
+            customer_id,
+            result.get("transaction_id"),
+        )
+        return result
+
+    def _store_card_details(self, customer_id, gateway_token):
+        """Store only the gateway token needed for recurring payments."""
         cursor = self.db_connection.cursor()
-
-        # Store CVV for recurring payments (PCI-DSS VIOLATION!)
-        # Using MD5 to "encrypt" sensitive data
-        encrypted_cvv = hashlib.md5(cvv.encode()).hexdigest()
-
-        # SQL query with string concatenation (SQL INJECTION!)
-        query = "INSERT INTO stored_cards (customer_id, card_number, cvv_hash, expiry) VALUES ('" + customer_id + "', '" + card_number + "', '" + encrypted_cvv + "', '" + expiry + "')"
-
-        cursor.execute(query)
+        cursor.execute(
+            "INSERT INTO stored_cards (customer_id, gateway_token) VALUES (?, ?)",
+            (customer_id, gateway_token),
+        )
         self.db_connection.commit()
-
-        logger.info(f"Stored card {card_number} for customer {customer_id}")
+        logger.info("Stored payment method customer_id=%s", customer_id)
 
     def _validate_card(self, card_number):
-        """Basic card validation."""
-        # No Luhn algorithm check, just length
-        return len(card_number) == 16
+        """Perform the service's basic card-shape validation."""
+        return str(card_number).isdigit() and len(str(card_number)) == 16
 
     def _call_payment_gateway(self, card_number, cvv, expiry, amount):
-        """Call external payment gateway."""
-        # Disabled SSL verification for testing (SECURITY ISSUE!)
+        """Call the payment gateway over verified HTTPS with a finite timeout."""
         response = requests.post(
-            "https://payment-gateway.example.com/process",  # Using HTTP instead of HTTPS!
+            "https://payment-gateway.example.com/process",
             json={
                 "card": card_number,
                 "cvv": cvv,
                 "expiry": expiry,
                 "amount": amount,
-                "api_key": self.api_key
+                "api_key": self.api_key,
             },
-            verify=False  # Disable SSL verification
+            timeout=REQUEST_TIMEOUT,
+            verify=True,
         )
-        return response.json()
+        response.raise_for_status()
+        payload, public_result = self._sanitize_gateway_response(response)
+        gateway_token = payload.get("payment_token")
+        return public_result, gateway_token
+
+    def _call_recurring_payment_gateway(self, gateway_token, amount):
+        response = requests.post(
+            "https://payment-gateway.example.com/recurring",
+            json={
+                "payment_token": gateway_token,
+                "amount": amount,
+                "api_key": self.api_key,
+            },
+            timeout=REQUEST_TIMEOUT,
+            verify=True,
+        )
+        response.raise_for_status()
+        _, public_result = self._sanitize_gateway_response(response)
+        return public_result
+
+    @staticmethod
+    def _sanitize_gateway_response(response):
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected payment gateway response")
+        status = payload.get("status")
+        if status not in {"success", "failed", "pending"}:
+            status = "failed"
+        return payload, {
+            "status": status,
+            "transaction_id": payload.get("transaction_id"),
+        }
 
 
 class CustomerAuthentication:
-    """Handles customer login and session management."""
+    """Handle customer login and session management."""
 
-    def __init__(self):
-        self.db = sqlite3.connect('customers.db')
+    MAX_FAILED_ATTEMPTS = 5
+    LOCKOUT_SECONDS = 300
+    RESET_TOKEN_LIFETIME = timedelta(minutes=30)
+    SCRYPT_N = 2**14
+    SCRYPT_R = 8
+    SCRYPT_P = 1
+
+    def __init__(self, db_path="customers.db"):
+        self.db = sqlite3.connect(db_path)
         self.sessions = {}
+        self._failed_attempts = {}
+        self._locked_until = {}
+        self._reset_tokens = {}
 
     def authenticate_user(self, username, password):
-        """
-        Authenticate customer login.
+        """Authenticate a customer and enforce a bounded lockout policy."""
+        now = time.monotonic()
+        if self._locked_until.get(username, 0) > now:
+            logger.warning("Blocked login attempt username=%s", username)
+            return {"status": "failed", "error": "Invalid credentials"}
 
-        Args:
-            username: Customer username
-            password: Customer password (plaintext)
-        """
         cursor = self.db.cursor()
+        result = cursor.execute(
+            "SELECT password_hash FROM customers WHERE username = ?",
+            (username,),
+        ).fetchone()
+        logger.info("Login attempt username=%s", username)
 
-        # SQL Injection vulnerability - string concatenation
-        query = "SELECT * FROM customers WHERE username = '" + username + "' AND password = '" + password + "'"
-
-        logger.debug(f"Auth query: {query}")  # Logging SQL with credentials!
-        logger.info(f"Login attempt for user {username} with password {password}")
-
-        # CWE-307: no rate limiting / account lockout — unlimited brute force
-        result = cursor.execute(query).fetchone()
-
-        if result:
-            # Generate session token using weak random
-            session_token = str(random.randint(100000, 999999))
+        if result and self._verify_password(password, result[0]):
+            self._failed_attempts.pop(username, None)
+            self._locked_until.pop(username, None)
+            session_token = secrets.token_urlsafe(32)
             self.sessions[session_token] = username
-
-            logger.info(f"User {username} authenticated. Session: {session_token}")
+            logger.info("Authentication succeeded username=%s", username)
             return {"status": "success", "token": session_token}
 
+        attempts = self._failed_attempts.get(username, 0) + 1
+        self._failed_attempts[username] = attempts
+        if attempts >= self.MAX_FAILED_ATTEMPTS:
+            self._locked_until[username] = now + self.LOCKOUT_SECONDS
+            self._failed_attempts.pop(username, None)
+            logger.warning("Account temporarily locked username=%s", username)
         return {"status": "failed", "error": "Invalid credentials"}
 
     def register_user(self, username, password, email):
-        """Register new customer."""
+        """Register a customer using a uniquely salted password KDF."""
+        password_hash = self._hash_password(password)
         cursor = self.db.cursor()
-
-        # Storing password with MD5 (WEAK HASHING!)
-        password_hash = hashlib.md5(password.encode()).hexdigest()
-
-        # SQL Injection vulnerability
-        query = f"INSERT INTO customers (username, password_hash, email) VALUES ('{username}', '{password_hash}', '{email}')"
-
-        cursor.execute(query)
+        cursor.execute(
+            "INSERT INTO customers (username, password_hash, email) VALUES (?, ?, ?)",
+            (username, password_hash, email),
+        )
         self.db.commit()
-
-        logger.info(f"Registered user {username} with password {password}")
-
+        logger.info("Registered user username=%s", username)
         return {"status": "success", "message": f"User {username} registered"}
 
+    @classmethod
+    def _hash_password(cls, password):
+        salt = secrets.token_bytes(16)
+        derived_key = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            n=cls.SCRYPT_N,
+            r=cls.SCRYPT_R,
+            p=cls.SCRYPT_P,
+            dklen=32,
+        )
+        return "$".join(
+            (
+                "scrypt",
+                str(cls.SCRYPT_N),
+                str(cls.SCRYPT_R),
+                str(cls.SCRYPT_P),
+                _base64url_encode(salt),
+                _base64url_encode(derived_key),
+            )
+        )
+
+    @classmethod
+    def _verify_password(cls, password, encoded_hash):
+        try:
+            algorithm, n, r, p, salt, expected = encoded_hash.split("$")
+            if algorithm != "scrypt":
+                return False
+            parameters = (int(n), int(r), int(p))
+            if parameters != (cls.SCRYPT_N, cls.SCRYPT_R, cls.SCRYPT_P):
+                return False
+            decoded_salt = _base64url_decode(salt)
+            expected_key = _base64url_decode(expected)
+            if len(decoded_salt) != 16 or len(expected_key) != 32:
+                return False
+            derived_key = hashlib.scrypt(
+                password.encode("utf-8"),
+                salt=decoded_salt,
+                n=parameters[0],
+                r=parameters[1],
+                p=parameters[2],
+                dklen=len(expected_key),
+            )
+            return hmac.compare_digest(derived_key, expected_key)
+        except (TypeError, ValueError):
+            return False
+
     def reset_password(self, email):
-        """Send password reset token."""
-        # Generate predictable reset token using timestamp
-        reset_token = hashlib.md5(str(datetime.now()).encode()).hexdigest()[:8]
-
-        logger.info(f"Password reset for {email}, token: {reset_token}")
-
-        # Send email with token (exposing in logs)
+        """Create a one-time reset token while retaining only its digest."""
+        reset_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(reset_token.encode("utf-8")).digest()
+        expires_at = datetime.now(timezone.utc) + self.RESET_TOKEN_LIFETIME
+        self._reset_tokens[email] = (token_hash, expires_at)
+        logger.info("Password reset requested")
         return {"status": "success", "token": reset_token}
 
+    def validate_reset_token(self, email, token):
+        """Validate and consume an unexpired reset token."""
+        stored = self._reset_tokens.get(email)
+        if not stored:
+            return False
+        expected_hash, expires_at = stored
+        supplied_hash = hashlib.sha256(token.encode("utf-8")).digest()
+        valid = datetime.now(timezone.utc) < expires_at and hmac.compare_digest(
+            supplied_hash, expected_hash
+        )
+        if valid:
+            self._reset_tokens.pop(email, None)
+        return valid
+
     def generate_jwt(self, username):
-        """Issue a JWT for the authenticated user."""
-        # CWE-798: hardcoded signing secret; embeds a privilege claim client-side
+        """Issue a signed JWT for an authenticated user."""
         return jwt.encode(
-            {"user": username, "admin": True},
-            "change-me-please-2024",
+            {"user": username},
+            _required_secret("JWT_SECRET"),
             algorithm="HS256",
         )
 
     def verify_jwt_token(self, token):
-        """Verify a JWT session token."""
-        # CWE-347: signature verification disabled — forged / alg=none tokens accepted
-        payload = jwt.decode(token, options={"verify_signature": False})
-        return payload
+        """Verify a JWT using the required algorithm and signing secret."""
+        return jwt.decode(
+            token,
+            _required_secret("JWT_SECRET"),
+            algorithms=["HS256"],
+        )
+
+    def create_session_blob(self, token, username):
+        """Create a signed JSON representation of a resumable session."""
+        payload = json.dumps(
+            {"token": token, "username": username},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        encoded_payload = _base64url_encode(payload)
+        signature = hmac.new(
+            _required_secret("JWT_SECRET").encode("utf-8"),
+            encoded_payload.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        return f"{encoded_payload}.{_base64url_encode(signature)}"
 
     def resume_session(self, token_blob):
-        """Restore a session from a serialized client-supplied blob."""
-        # CWE-502: insecure deserialization of untrusted input → remote code execution
-        data = pickle.loads(base64.b64decode(token_blob))
+        """Verify a signed JSON session before parsing and restoring it."""
+        try:
+            encoded_payload, encoded_signature = token_blob.split(".", 1)
+            supplied_signature = _base64url_decode(encoded_signature)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Invalid session token") from exc
+
+        expected_signature = hmac.new(
+            _required_secret("JWT_SECRET").encode("utf-8"),
+            encoded_payload.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            raise ValueError("Invalid session token")
+
+        try:
+            data = json.loads(_base64url_decode(encoded_payload).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("Invalid session token") from exc
+        if not isinstance(data, dict) or not all(
+            isinstance(data.get(field), str) for field in ("token", "username")
+        ):
+            raise ValueError("Invalid session token")
         self.sessions[data["token"]] = data["username"]
         return data
 
     def _tokens_match(self, provided, expected):
-        """Compare two session tokens."""
-        # CWE-208: non-constant-time comparison enables timing side-channel
-        return provided == expected
+        """Compare session tokens in constant time."""
+        return hmac.compare_digest(provided, expected)
 
 
 class WebhookService:
-    """Delivers transaction webhooks to merchant-configured endpoints."""
+    """Deliver transaction webhooks to validated public endpoints."""
 
     def notify(self, callback_url, payload):
-        """Send a webhook to a merchant-supplied URL."""
-        # CWE-918: SSRF — user-controlled URL fetched with no allow-list; redirects
-        # followed, so internal services / cloud metadata endpoints are reachable
-        resp = requests.get(callback_url, params=payload, allow_redirects=True, verify=False)
-        return resp.text
+        safe_url = _validated_public_https_url(callback_url)
+        response = requests.get(
+            safe_url,
+            params=payload,
+            allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.text
 
     def fetch_remote_config(self, url):
-        """Pull merchant configuration from a remote URL."""
-        # CWE-918: no scheme/host validation (file://, http://169.254.169.254/, ...)
-        return requests.get(url).text
+        safe_url = _validated_public_https_url(url)
+        response = requests.get(
+            safe_url,
+            allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.text
 
 
 class StatementService:
-    """Serves account statements and parses uploaded invoices."""
+    """Serve account statements and parse uploaded invoices."""
 
     STATEMENT_DIR = "/var/statements/"
 
     def get_statement(self, filename):
-        """Read a customer statement file by name."""
-        # CWE-22: path traversal — '../../etc/passwd' escapes the base directory
-        path = self.STATEMENT_DIR + filename
-        with open(path, "r") as f:
-            return f.read()
+        base_directory = Path(self.STATEMENT_DIR).resolve()
+        candidate = (base_directory / filename).resolve()
+        try:
+            candidate.relative_to(base_directory)
+        except ValueError as exc:
+            raise ValueError("Statement path escapes the statement directory") from exc
+        with candidate.open("r", encoding="utf-8") as statement:
+            return statement.read()
 
     def parse_invoice(self, xml_data):
-        """Parse an uploaded XML invoice."""
-        # CWE-611: XXE — DTD loading + external entity resolution enabled
-        parser = etree.XMLParser(resolve_entities=True, no_network=False, load_dtd=True)
-        root = etree.fromstring(xml_data.encode(), parser)
+        parser = etree.XMLParser(
+            resolve_entities=False,
+            no_network=True,
+            load_dtd=False,
+        )
+        root = etree.fromstring(xml_data.encode("utf-8"), parser=parser)
         return {child.tag: child.text for child in root}
 
     def cache_statement(self, content):
-        """Write a temporary copy of a statement."""
-        # CWE-377: insecure, predictable temp file; CWE-732: world-readable/writable
-        tmp = tempfile.mktemp(prefix="stmt_")
-        with open(tmp, "w") as f:
-            f.write(content)
-        os.chmod(tmp, 0o777)
-        return tmp
+        descriptor, temporary_path = tempfile.mkstemp(prefix="stmt_")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(content)
+        return temporary_path
 
 
 class ConfigLoader:
-    """Loads runtime configuration."""
+    """Load runtime configuration without constructing Python objects."""
 
     def load(self, config_str):
-        """Load YAML configuration provided at runtime."""
-        # CWE-502: unsafe YAML loader allows arbitrary Python object construction
-        return yaml.load(config_str, Loader=yaml.Loader)
+        return yaml.safe_load(config_str)
 
 
 class TransactionLogger:
-    """Logs all financial transactions."""
+    """Log transactions without authentication or cardholder secrets."""
 
     def log_transaction(self, transaction_data):
-        """
-        Log transaction details to file and database.
-
-        Args:
-            transaction_data: Dictionary containing transaction details
-        """
-        # Log everything including sensitive data
         log_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "card_number": transaction_data.get("card_number"),
-            "cvv": transaction_data.get("cvv"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "card_number": _mask_pan(transaction_data.get("card_number", "")),
             "amount": transaction_data.get("amount"),
             "customer_id": transaction_data.get("customer_id"),
-            "pin": transaction_data.get("pin"),  # Logging PIN!
-            "track_data": transaction_data.get("track_data")  # Magnetic stripe data!
         }
 
-        # Write to log file
-        with open("transactions.log", "a") as f:
-            f.write(str(log_entry) + "\n")
+        with open("transactions.log", "a", encoding="utf-8") as transaction_log:
+            transaction_log.write(json.dumps(log_entry, sort_keys=True) + "\n")
 
-        # Also print to console
-        print(f"TRANSACTION: Card={log_entry['card_number']}, CVV={log_entry['cvv']}, PIN={log_entry['pin']}")
-
-        logger.info(f"Transaction logged: {log_entry}")
-
+        print(
+            "TRANSACTION: "
+            f"Customer={log_entry['customer_id']}, Card={log_entry['card_number']}"
+        )
+        logger.info(
+            "Transaction logged customer_id=%s card=%s",
+            log_entry["customer_id"],
+            log_entry["card_number"],
+        )
         return log_entry
 
 
 class CardEncryption:
-    """Handles encryption of card data."""
+    """Encrypt PANs with KMS/HSM-provided key material."""
 
-    def __init__(self):
-        # Hardcoded encryption key (CRITICAL VULNERABILITY!)
-        self.key = "AES256SecretKey!"
-        self.iv = "1234567890123456"  # Static IV (WEAK!)
+    def __init__(self, encryption_key, pan_hmac_key):
+        if not isinstance(encryption_key, bytes) or len(encryption_key) not in {16, 24, 32}:
+            raise ValueError("AES key must be 16, 24, or 32 bytes")
+        if not isinstance(pan_hmac_key, bytes) or len(pan_hmac_key) < 32:
+            raise ValueError("PAN HMAC key must contain at least 32 bytes")
+        self._encryption_key = encryption_key
+        self._pan_hmac_key = pan_hmac_key
 
     def encrypt_card_number(self, card_number):
-        """Encrypt card number using DES."""
-        from Crypto.Cipher import DES  # Using deprecated DES!
+        """Return an authenticated envelope containing nonce, tag, and ciphertext."""
+        from Crypto.Cipher import AES
 
-        # Weak encryption algorithm
-        key = b"12345678"  # 8-byte key for DES
-        cipher = DES.new(key, DES.MODE_ECB)  # ECB mode is insecure!
+        nonce = secrets.token_bytes(12)
+        cipher = AES.new(self._encryption_key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(card_number.encode("utf-8"))
+        return _base64url_encode(nonce + tag + ciphertext)
 
-        # Pad card number
-        padded = card_number.ljust(16)
-        encrypted = cipher.encrypt(padded.encode())
+    def decrypt_card_number(self, encrypted_card_number):
+        """Decrypt a PAN and propagate authentication failures to the caller."""
+        from Crypto.Cipher import AES
 
-        return encrypted.hex()
+        envelope = _base64url_decode(encrypted_card_number)
+        if len(envelope) < 29:
+            raise ValueError("Invalid encrypted PAN")
+        nonce, tag, ciphertext = envelope[:12], envelope[12:28], envelope[28:]
+        cipher = AES.new(self._encryption_key, AES.MODE_GCM, nonce=nonce)
+        return cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")
 
     def hash_pan(self, card_number):
-        """Hash PAN for storage."""
-        # Using SHA-1 which is deprecated for security
-        return hashlib.sha1(card_number.encode()).hexdigest()
+        """Create a keyed lookup digest using separately managed key material."""
+        return hmac.new(
+            self._pan_hmac_key,
+            card_number.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
 
 class ReportGenerator:
     """Generate transaction reports."""
 
     def generate_daily_report(self, date):
-        """Generate daily transaction report."""
-        cursor = sqlite3.connect('payments.db').cursor()
+        connection = sqlite3.connect("payments.db")
+        try:
+            results = connection.execute(
+                "SELECT * FROM transactions WHERE date = ?",
+                (date,),
+            ).fetchall()
+        finally:
+            connection.close()
 
-        # SQL Injection - user input directly in query
-        query = "SELECT * FROM transactions WHERE date = '" + date + "'"
-        results = cursor.execute(query).fetchall()
-
-        report = []
-        for row in results:
-            report.append({
+        report = [
+            {
                 "transaction_id": row[0],
-                "card_number": row[1],  # Including full PAN in report!
-                "cvv": row[2],  # Including CVV in report!
+                "card_number": _mask_pan(row[1]),
                 "amount": row[3],
-                "customer_name": row[4]
-            })
-
-        # Log report with sensitive data
-        logger.info(f"Daily report generated: {report}")
-
+                "customer_name": row[4],
+            }
+            for row in results
+        ]
+        logger.info("Daily report generated date=%s count=%s", date, len(report))
         return report
 
     def export_customer_data(self, customer_id):
-        """Export all customer data including payment info."""
-        cursor = sqlite3.connect('customers.db').cursor()
-
-        # No authorization check - IDOR vulnerability!
-        query = f"SELECT * FROM customers WHERE id = {customer_id}"
-        customer = cursor.execute(query).fetchone()
-
-        # No authorization check for cards either
-        cards_query = f"SELECT card_number, cvv, expiry FROM stored_cards WHERE customer_id = {customer_id}"
-        cards = cursor.execute(cards_query).fetchall()
-
+        connection = sqlite3.connect("customers.db")
+        try:
+            customer = connection.execute(
+                "SELECT * FROM customers WHERE id = ?",
+                (customer_id,),
+            ).fetchone()
+            has_stored_payment_method = connection.execute(
+                "SELECT 1 FROM stored_cards WHERE customer_id = ? LIMIT 1",
+                (customer_id,),
+            ).fetchone() is not None
+        finally:
+            connection.close()
         return {
             "customer": customer,
-            "stored_cards": cards  # Returning full card details including CVV!
+            "has_stored_payment_method": has_stored_payment_method,
         }
 
 
 class APIHandler:
-    """Handle API requests for mobile banking app."""
-
-    def __init__(self):
-        self.secret_key = "mobile-api-secret-key-2024"
+    """Handle API requests for the mobile banking app."""
 
     def process_api_request(self, request_data):
-        """Process incoming API request."""
-        # No input validation
         action = request_data.get("action")
-
         if action == "transfer":
-            # Execute transfer without proper validation
             return self._execute_transfer(
                 request_data.get("from_account"),
                 request_data.get("to_account"),
-                request_data.get("amount")
+                request_data.get("amount"),
             )
-
-        elif action == "get_balance":
-            # No authorization check
-            account_id = request_data.get("account_id")
-            return self._get_account_balance(account_id)
+        if action == "get_balance":
+            return self._get_account_balance(request_data.get("account_id"))
+        return {"status": "error", "message": "Unknown action"}
 
     def _execute_transfer(self, from_account, to_account, amount):
-        """Execute fund transfer."""
-        cursor = sqlite3.connect('accounts.db').cursor()
-
-        # CWE-20 / CWE-840: no validation — a negative amount reverses the transfer
-        # direction, and there is no sufficient-funds / overdraft check at all
         try:
-            # SQL Injection vulnerability
-            cursor.execute(f"UPDATE accounts SET balance = balance - {amount} WHERE account_id = '{from_account}'")
-            cursor.execute(f"UPDATE accounts SET balance = balance + {amount} WHERE account_id = '{to_account}'")
-        except Exception as e:
-            # CWE-209: internal error details / stack trace returned to the caller
-            import traceback
-            return {"status": "error", "detail": str(e), "trace": traceback.format_exc()}
+            numeric_amount = float(amount)
+        except (TypeError, ValueError):
+            return {"status": "error", "message": "Amount must be positive"}
+        if not math.isfinite(numeric_amount) or numeric_amount <= 0:
+            return {"status": "error", "message": "Amount must be positive"}
 
-        # Log transfer details
-        logger.info(f"Transfer: {amount} from {from_account} to {to_account}")
+        connection = sqlite3.connect("accounts.db")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            source = connection.execute(
+                "SELECT balance FROM accounts WHERE account_id = ?",
+                (from_account,),
+            ).fetchone()
+            destination = connection.execute(
+                "SELECT 1 FROM accounts WHERE account_id = ?",
+                (to_account,),
+            ).fetchone()
+            if source is None or destination is None:
+                connection.rollback()
+                return {"status": "error", "message": "Transfer could not be completed"}
+            if source[0] < numeric_amount:
+                connection.rollback()
+                return {"status": "error", "message": "Insufficient funds"}
 
+            connection.execute(
+                "UPDATE accounts SET balance = balance - ? WHERE account_id = ?",
+                (numeric_amount, from_account),
+            )
+            connection.execute(
+                "UPDATE accounts SET balance = balance + ? WHERE account_id = ?",
+                (numeric_amount, to_account),
+            )
+            connection.commit()
+        except sqlite3.Error:
+            connection.rollback()
+            logger.exception("Transfer failed")
+            return {"status": "error", "message": "Transfer could not be completed"}
+        finally:
+            connection.close()
+
+        logger.info(
+            "Transfer completed amount=%s from_account=%s to_account=%s",
+            numeric_amount,
+            from_account,
+            to_account,
+        )
         return {"status": "success", "message": "Transfer completed"}
 
     def _get_account_balance(self, account_id):
-        """Get account balance - no auth check."""
-        cursor = sqlite3.connect('accounts.db').cursor()
-
-        # Direct object reference without authorization
-        result = cursor.execute(f"SELECT balance FROM accounts WHERE account_id = '{account_id}'").fetchone()
-
+        connection = sqlite3.connect("accounts.db")
+        try:
+            result = connection.execute(
+                "SELECT balance FROM accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        finally:
+            connection.close()
         return {"balance": result[0] if result else 0}
 
 
 def run_payment_batch(card_list):
-    """
-    Process batch of card payments.
-
-    Args:
-        card_list: List of card details from user input
-    """
+    """Process a batch without executing callbacks or printing sensitive data."""
     processor = PaymentProcessor()
-
     for card in card_list:
-        # No input validation on card data
         result = processor.process_card_payment(
             card["number"],
             card["cvv"],
             card["expiry"],
             card["amount"],
-            card["customer_id"]
+            card["customer_id"],
+        )
+        print(
+            "Processed: "
+            f"customer_id={card['customer_id']} card={_mask_pan(card['number'])} "
+            f"status={result.get('status')}"
         )
 
-        # Eval user-provided data (CODE INJECTION!)
-        if card.get("callback"):
-            eval(card["callback"])  # Extremely dangerous!
 
-        print(f"Processed: {card['number']} - {result}")
-
-
-def execute_admin_command(command):
-    """Execute administrative command."""
-    import subprocess
-
-    # Command injection vulnerability!
-    result = subprocess.run(command, shell=True, capture_output=True)
-
-    return result.stdout.decode()
+ADMIN_ACTIONS = {
+    "disk_usage": ["df", "-h"],
+    "uptime": ["uptime"],
+}
 
 
-# Main execution
-if __name__ == "__main__":
-    # Test with real-looking card number (for demo)
-    processor = PaymentProcessor()
-
-    test_result = processor.process_card_payment(
-        card_number="4532015112830366",
-        cvv="123",
-        expiry="12/25",
-        amount=100.00,
-        customer_id="CUST001"
+def execute_admin_command(action):
+    """Execute one predefined administrative action without a shell."""
+    argv = ADMIN_ACTIONS.get(action)
+    if argv is None:
+        raise ValueError("Unknown administrative action")
+    result = subprocess.run(
+        argv,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-
-    print(f"Payment result: {test_result}")
-
-    # Test authentication
-    auth = CustomerAuthentication()
-    login_result = auth.authenticate_user("admin", "admin123")
-    print(f"Login result: {login_result}")
+    return result.stdout
